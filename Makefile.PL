@@ -8,7 +8,7 @@ WriteMakefile(
     VERSION_FROM      => 'lib/WWW/iTunesConnect.pm', # finds $VERSION
     PREREQ_PM         => { 'HTML::Form'             => 0,
                            'IO::Uncompress::Gunzip' => 0,
-                           'Net::SSLeay'            => 0
+                           'Net::SSLeay'            => 0,
                            'LWP'                    => 0,
                          },
     ($] >= 5.005 ?     ## Add these new keywords supported since 5.005
