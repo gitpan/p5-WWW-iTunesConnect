@@ -12,7 +12,7 @@ use strict;
 use warnings;
 use vars qw($VERSION);
 
-$VERSION = "1.13";
+$VERSION = "1.14";
 
 use LWP;
 use HTML::Form;
@@ -38,6 +38,9 @@ sub new
 
     $self->{ua} = LWP::UserAgent->new(%options);
     $self->{ua}->cookie_jar({});
+    # Allow POST requests to be redirected because some of the international
+    #  iTC mirrors redirect various requests
+    push @{ $self->{ua}->requests_redirectable}, 'POST';
 
     return $self;
 }
@@ -143,6 +146,7 @@ sub daily_sales_summary
 
 # Get an HTML::Form object for the Sales/Trends Reports Daily Summary page
     my $form = $s->daily_sales_summary_form();
+    return undef unless $form;
 # Submit the form to get the latest daily summary
     $form->value('#selReportType', 'Summary');
     $form->value('#selDateType', 'Daily');
@@ -176,9 +180,11 @@ sub financial_report_list
 
 # Get the Items/Page form and set to display the max number of reports
     my @forms = HTML::Form->parse($r);
-    @forms = grep $_->attr('name') eq 'f_0_0_5_1_5_1_1_2_9', @forms;
-    return undef unless @forms;
+    @forms = grep $_->find_input('itemsPerPage', 'text'), @forms;
     my $form = shift @forms;
+    return undef unless $form;
+
+    # Parse the input's label to find the highest value that it can be set to
     $r->as_string =~ /items\/page \(max (\d+)\)/;
     $form->value('itemsPerPage', $1);
     $r = $s->{ua}->request($form->click);
@@ -318,6 +324,7 @@ sub monthly_free_summary
 
 # Get an HTML::Form object for the Sales/Trends Reports Daily Summary page
     my $form = $s->monthly_free_summary_form();
+    return undef unless $form;
 # Submit the form to get the latest weekly summary
     $form->value('#selReportType', 'Summary');
     $form->value('#selDateType', 'Monthly Free');
@@ -375,6 +382,7 @@ sub weekly_sales_summary
 
 # Get an HTML::Form object for the Sales/Trends Reports Daily Summary page
     my $form = $s->weekly_sales_summary_form();
+    return undef unless $form;
 # Submit the form to get the latest weekly summary
     $form->value('#selReportType', 'Summary');
     $form->value('#selDateType', 'Weekly');
