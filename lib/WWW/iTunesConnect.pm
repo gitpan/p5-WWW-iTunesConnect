@@ -12,7 +12,7 @@ use strict;
 use warnings;
 use vars qw($VERSION);
 
-$VERSION = "1.14";
+$VERSION = "1.15";
 
 use LWP;
 use HTML::Form;
@@ -65,6 +65,59 @@ sub parse_table
     ('header', \@header, 'data', \@data);
 }
 
+# Parse a raw financial report into a report hash
+sub parse_financial_report
+{
+    my ($content) = @_;
+
+    # Parse the data
+    my %table = parse_table($content);
+    my ($header, $data) = @table{qw(header data)};
+
+    # Strip blank lines
+    @$data = grep { scalar @$_ } @$data;
+
+    # Strip off the Total row and parse it
+    my $total = pop @$data;
+    my $currency;
+    if( 1 == scalar @$total )	# Late-2010 style report
+    {
+	$total = shift @$total;
+	$total =~ s/[^\d.,]//g;
+    }
+    else
+    {
+	$currency = @$total[8];
+	$total = @$total[7];
+	$total =~ s/[^\d.,]//g;
+    }
+
+    # Convert the various region-specific date formats to YYYYMMDD
+    my $startIndex = 0;
+    my $endIndex = 0;
+    ++$startIndex while $header->[$startIndex] ne 'Start Date';
+    ++$endIndex while $header->[$endIndex] ne 'End Date';
+    my $eu_reg = qr/(\d\d)\.(\d\d)\.(\d{4})/;
+    my $us_reg = qr/(\d\d)\/(\d\d)\/(\d{4})/;
+    for( @$data )
+    {
+	if( @$_[$startIndex] =~ $eu_reg )       # EU format
+	{
+	    @$_[$startIndex] = $3.$2.$1;
+	    @$_[$endIndex] =~ $eu_reg;
+	    @$_[$endIndex] = $3.$2.$1;
+	}
+	elsif( @$_[$startIndex] =~ $us_reg )    # US format
+	{
+	    @$_[$startIndex] = $3.$1.$2;
+	    @$_[$endIndex] =~ $us_reg;
+	    @$_[$endIndex] = $3.$1.$2;
+	}
+    }
+
+    ('header', $header, 'data', $data, 'total', $total, 'currency', $currency);
+}
+
 # Parse a gzip'd summary file fetched from the Sales/Trend page
 #  First argument is same as input argument to gunzip constructor
 #  Remaining arguments are passed as options to gunzip
@@ -90,24 +143,45 @@ sub login
 # Bail out if no username and password
     return undef unless $s->{user} and $s->{password};
 # Prevent repeat logins
-    return 1 if $s->{sales_path} and $s->{financial_path};
+    return 1 if $s->{response}{login} and !($s->{response}{login}->is_error);
 
 # Fetch the login page
     my $r = $s->request('/WebObjects/MZLabel.woa/wa/default');
     return undef unless $r;
-# Pull out the path for submitting user credentials
-    $r->as_string =~ /<form.*name=.*action="(.*)">/;
-#    $s->{login_url} = $1;
-    return undef unless $1;
+    $s->{login_page} = $r->content;
+# Find the login form
+    my @forms = HTML::Form->parse($r);
+    @forms = grep $_->attr('name') eq 'appleConnectForm', @forms;
+    return undef unless @forms;
+    $s->{form}{login} = shift @forms;
+    return undef unless $s->{form}{login};
+
 # Submit the user's credentials
-    $r = $s->request($1.'?theAccountName='.$s->{user}.'&theAccountPW='.$s->{password}.'&theAuxValue=');
-    return undef unless $r;
-# Find the Sales/Trend Reports path and save it for later
-    $r->as_string =~ /href="(.*)">\s*\n\s*<b>Sales\/Trend Reports<\/b>/;
-    $s->{sales_path} = $1;
-# Find the Financial Reports path and save it for later
-    $r->as_string =~ /href="(.*)">\s*\n\s*<b>Financial Reports<\/b>/;
-    $s->{financial_path} = $1;
+    $s->{form}{login}->value('#accountname', $s->{user});
+    $s->{form}{login}->value('#accountpassword', $s->{password});
+    $s->{response}{login} = $s->{ua}->request($s->{form}{login}->click('1.Continue'));
+    return undef unless $s->{response}{login} and !($s->{response}{login}->is_error);
+
+    # Parse the page into a tree
+    my $tree = HTML::TreeBuilder->new_from_content($s->{response}{login}->as_string);
+
+    # Look for a failed login notification. The login response doesn't set any
+    #  error codes on failure; it merely displays a notice to the user. Try to
+    #  detect the notice by looking for a span tag with class dserror.
+    my @failure = $tree->look_down('_tag', 'span', 'class', 'dserror');
+    return undef if @failure;	# Bail out
+
+    # Look for any notifications that Apple may be trying to send to the developer
+    my @notifications = $tree->look_down('_tag', 'div', 'class', 'simple-notification');
+    if( @notifications )
+    {
+	push @{$s->{login_notifications}}, $_->as_HTML for @notifications;
+	return undef;	# Bail out until the developer handles the message
+    }
+
+    # Save the parsed main menu tree for later
+    $s->{main_menu_tree} = $tree;
+
     1;
 }
 
@@ -163,6 +237,28 @@ sub daily_sales_summary
     (parse_sales_summary(\$r->content), 'file', $r->content, 'filename', $filename);
 }
 
+# Fetch a financial report for a given date and region
+sub fetch_financial_report
+{
+    my $s = shift;
+    my $month = shift if scalar @_;
+    return undef unless $month and ($month =~ /\d{4}\d{2}/);
+    my $region = shift if scalar @_;
+    return undef unless $region;
+
+    # Get the list of available reports
+    my $list = $s->financial_report_list();
+
+    # Check that the requested report is available
+    return undef unless $list and $list->{$month} and $list->{$month}->{$region};
+
+    # Fetch the report
+    my $r = $s->request($list->{$month}->{$region}{path});
+    return undef unless $r and $r->is_success and $r->content;
+
+    ('filename', $list->{$month}->{$region}{filename}, 'content', $r->content);
+}
+
 # Fetch the list of available financial reports
 sub financial_report_list
 {
@@ -171,11 +267,8 @@ sub financial_report_list
 # Return cached list to avoid another trip on the net
     return $s->{financial_reports} if $s->{financial_reports};
 
-# Check for a valid login
-    return undef unless $s->login;
-
 # Fetch the Financial Reports page
-    my $r = $s->request($s->{financial_path});
+    my $r = $s->financial_response();
     return undef unless $r;
 
 # Get the Items/Page form and set to display the max number of reports
@@ -189,12 +282,23 @@ sub financial_report_list
     $form->value('itemsPerPage', $1);
     $r = $s->{ua}->request($form->click);
     return undef unless $r;
+    $s->{response}{financial_list} = $r;
 
 # Parse the page into a tree
     my $tree = HTML::TreeBuilder->new_from_content($r->as_string);
 
-    # Get the table by address (because there's nothing unique about it) and then get all child rows
-    my @rows = $tree->address('0.1.2.0.0.0.3.1.1')->look_down('_tag','tr');
+    # Find the table of financial reports by finding the 'itemsPerPage' input
+    #  element and then looking upwards to find the enclosing table. Then find
+    #  the table that encloses that one.
+    my $input = $tree->look_down('_tag', 'input', 'name', 'itemsPerPage');
+    return undef unless $input;
+    my $table = $input->look_up('_tag', 'table');
+    return undef unless $table;
+    $table = $table->parent->look_up('_tag', 'table');
+    return undef unless $table;
+
+    # Now find the rows for the list of financial reports
+    my @rows = $table->look_down('_tag','tr');
     # The first 3 rows are headers, etc so get rid of them
     @rows = @rows[3..$#rows];
 
@@ -236,46 +340,16 @@ sub financial_report
     my %out;
     for( keys %{$regions} )
     {
-	my $r = $s->request($regions->{$_}{path});
-	next unless $r;
+	my %report = $s->fetch_financial_report($date, $_);
+	next unless %report;
 
 	# Parse the data
-	my %table = parse_table($r->content);
-	my ($header, $data) = @table{qw(header data)};
+	my %parsed = parse_financial_report($report{'content'});
+	next unless %parsed;
 
-	# Strip off the Total row and parse it
-	my @total = grep {$_ && length $_} @{$data->[-1]};
-	@total = undef unless shift(@total) eq 'Total';
-	if( @total )
-	{
-	    pop @$data;  # Remove the Total row from the data
-	    pop @$data;  # Discard the blank row
-	}
-
-	# Convert the various region-specific date formats to YYYYMMDD
-	my $startIndex = 0;
-	my $endIndex = 0;
-	++$startIndex while $header->[$startIndex] ne 'Start Date';
-	++$endIndex while $header->[$endIndex] ne 'End Date';
-	my $eu_reg = qr/(\d\d)\.(\d\d)\.(\d{4})/;
-	my $us_reg = qr/(\d\d)\/(\d\d)\/(\d{4})/;
-	for( @$data )
-	{
-	    if( @$_[$startIndex] =~ $eu_reg )       # EU format
-	    {
-		@$_[$startIndex] = $3.$2.$1;
-		@$_[$endIndex] =~ $eu_reg;
-		@$_[$endIndex] = $3.$2.$1;
-	    }
-	    elsif( @$_[$startIndex] =~ $us_reg )    # US format
-	    {
-		@$_[$startIndex] = $3.$1.$2;
-		@$_[$endIndex] =~ $us_reg;
-		@$_[$endIndex] = $3.$1.$2;
-	    }
-	}
-
-	@{$out{$date}{$_}}{qw(header data file filename total currency)} = ($header, $data, $r->content, $regions->{$_}{filename}, @total);
+	$out{$date}{$_} = \%parsed;
+	$out{$date}{$_}{'file'} = $report{'content'};
+	$out{$date}{$_}{'filename'} = $report{'filename'};
     }
     %out;   # Return
 }
@@ -421,7 +495,7 @@ sub daily_sales_summary_form
     my ($s) = @_;
 
 # Use cached response to avoid another trip on the net
-    unless( $s->{daily_summary_sales_response} )
+    unless( $s->{response}{daily_summary_sales} )
     {
 # Get an HTML::Form object for the Sales/Trends Reports page. Then fill it out
 #  and submit it to get a list of available Daily Summary dates.
@@ -431,12 +505,12 @@ sub daily_sales_summary_form
         $form->value('#selDateType', 'Daily');
         $form->value('hiddenSubmitTypeName', 'ShowDropDown');
         my $r = $s->{ua}->request($form->click('download'));
-        $s->{daily_summary_sales_response} = $r;
+        $s->{response}{daily_summary_sales} = $r;
     }
 
 # The response includes a form containing a select input element with the list 
 #  of available dates. Create and return a form object for it.
-    my @forms = HTML::Form->parse($s->{daily_summary_sales_response});
+    my @forms = HTML::Form->parse($s->{response}{daily_summary_sales});
     @forms = grep $_->attr('name') eq 'frmVendorPage', @forms;
     return undef unless @forms;
     shift @forms;
@@ -448,7 +522,7 @@ sub monthly_free_summary_form
     my ($s) = @_;
 
 # Use cached response to avoid another trip on the net
-    unless( $s->{monthly_summary_free_response} )
+    unless( $s->{response}{monthly_summary_free} )
     {
 # Get an HTML::Form object for the Sales/Trends Reports page. Then fill it out
 #  and submit it to get a list of available Monthly Summary dates.
@@ -458,12 +532,12 @@ sub monthly_free_summary_form
         $form->value('#selDateType', 'Monthly Free');
         $form->value('hiddenSubmitTypeName', 'ShowDropDown');
         my $r = $s->{ua}->request($form->click('download'));
-        $s->{monthly_summary_free_response} = $r;
+        $s->{response}{monthly_summary_free} = $r;
     }
 
 # The response includes a form containing a select input element with the list 
 #  of available dates. Create and return a form object for it.
-    my @forms = HTML::Form->parse($s->{monthly_summary_free_response});
+    my @forms = HTML::Form->parse($s->{response}{monthly_summary_free});
     @forms = grep $_->attr('name') eq 'frmVendorPage', @forms;
     return undef unless @forms;
     shift @forms;
@@ -475,7 +549,7 @@ sub weekly_sales_summary_form
     my ($s) = @_;
 
 # Use cached response to avoid another trip on the net
-    unless( $s->{weekly_summary_sales_response} )
+    unless( $s->{response}{weekly_summary_sales} )
     {
 # Get an HTML::Form object for the Sales/Trends Reports page. Then fill it out
 #  and submit it to get a list of available Weekly Summary dates.
@@ -485,12 +559,12 @@ sub weekly_sales_summary_form
         $form->value('#selDateType', 'Weekly');
         $form->value('hiddenSubmitTypeName', 'ShowDropDown');
         my $r = $s->{ua}->request($form->click('download'));
-        $s->{weekly_summary_sales_response} = $r;
+        $s->{response}{weekly_summary_sales} = $r;
     }
 
 # The response includes a form containing a select input element with the list 
 #  of available dates. Create and return a form object for it.
-    my @forms = HTML::Form->parse($s->{weekly_summary_sales_response});
+    my @forms = HTML::Form->parse($s->{response}{weekly_summary_sales});
     @forms = grep $_->attr('name') eq 'frmVendorPage', @forms;
     return undef unless @forms;
     shift @forms;
@@ -504,6 +578,7 @@ sub sales_form
 # Fetch the Sales/Trend Report page
     my $r = $s->sales_response();
     return undef unless $r;
+    return undef if $r->is_error;   # Check the response code
 
     my @forms = HTML::Form->parse($r);
     @forms = grep $_->attr('name') eq 'frmVendorPage', @forms;
@@ -511,22 +586,61 @@ sub sales_form
     shift @forms;
 }
 
-# Follow the Sales/Trend Reports redirect and store the response for later use
+# Fetch the Financial Reports page and cache the response
+sub financial_response
+{
+    my $s = shift;
+
+# Returned the cached response to avoid another trip on the net
+    return $s->{response}{financial} if $s->{response}{financial};
+
+    unless( $s->{financial_path} )
+    {
+	# Nothing to do without the main menu
+	return undef unless $s->{main_menu_tree};
+
+	# Find the Fincial Reports path that's listed on the main menu
+	my $element = $s->{main_menu_tree}->look_down('_tag', 'a', sub { $_[0]->as_trimmed_text eq 'Financial Reports'});
+	return undef unless $element;
+	$s->{financial_path} = $element->attr('href');
+	return undef unless $s->{financial_path};
+    }
+
+    my $r = $s->request($s->{financial_path});
+    return undef unless $r;
+
+    $s->{response}{financial} = $r;
+}
+
+# Follow the Sales and Trends redirect and store the response for later use
 sub sales_response
 {
     my $s = shift;
 
 # Returned cached response to avoid another trip on the net
-    return $s->{sales_response} if $s->{sales_response};
+    return $s->{response}{sales} if $s->{response}{sales};
 
-# Check for a valid login
-    return undef unless $s->login;
+    unless( $s->{sales_path} )
+    {
+	# Nothing to do without the main menu
+	return undef unless $s->{main_menu_tree};
 
-# Handle the Sales/Trend Reports redirect 
+	# Find the Sales and Trends path that's listed on the main menu
+	my $element = $s->{main_menu_tree}->look_down('_tag', 'a', sub { $_[0]->as_trimmed_text eq 'Sales and Trends'});
+	return undef unless $element;
+	$s->{sales_path} = $element->attr('href');
+	return undef unless $s->{sales_path};
+    }
+
+# Handle the Sales and Trends page redirect
     my $r = $s->request($s->{sales_path});
+    return undef unless $r;
+
     $r->as_string =~ /<META HTTP-EQUIV="refresh" Content="0;URL=(.*)">/;
     $r = $s->{ua}->get($1);
-    $s->{sales_response} = $r;
+    return undef unless $r;
+
+    $s->{response}{sales} = $r;
 }
 
 # --- Internal use only ---
@@ -557,8 +671,8 @@ C<iTunesConnect> provides an interface to Apple's iTunes Connect website.
 Daily, Weekly and Monthly summaries, as well as Finanacial Reports, can be
 retrieved. Eventually this will become a complete interface.
 
-A script suitable for use as a nightly cronjob can be found at 
-L<http://bfoz.net/projects/itc/>
+A script suitable for use as a nightly cronjob can be found at
+L<http://github.com/bfoz/itunesconnect-tools>
 
 =head1 CONSTRUCTOR
 
@@ -641,6 +755,19 @@ header line.
 
 If a single string argument is given in the form 'MM/DD/YYYY' that date will be
 fetched instead (if it's available).
+
+=item $itc->fetch_financial_report($month, $region)
+
+Fetch the raw report content for a given month and region. The month argument
+must be of the form 'YYYYMM' and the region argument is the name of a region
+as listed on the Financial Reports page of iTunes Connect.
+
+Returns a hash with two keys:
+
+    Key		Description
+    -----------------------------------------------------------------------
+    filename	The report filename as listed on the Financial Reports page
+    content	Raw content of the report file
 
 =item $itc->financial_report_list()
 
