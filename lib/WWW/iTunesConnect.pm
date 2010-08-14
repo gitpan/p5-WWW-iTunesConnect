@@ -12,7 +12,7 @@ use strict;
 use warnings;
 use vars qw($VERSION);
 
-$VERSION = "1.15";
+$VERSION = "1.16";
 
 use LWP;
 use HTML::Form;
@@ -78,18 +78,31 @@ sub parse_financial_report
     @$data = grep { scalar @$_ } @$data;
 
     # Strip off the Total row and parse it
-    my $total = pop @$data;
+    my $last_row = pop @$data;
     my $currency;
-    if( 1 == scalar @$total )	# Late-2010 style report
+    my $units;
+    my $total;
+    # Detect the report format
+    if( 1 == scalar @$last_row )	# February 2009 - May 2010 format
     {
-	$total = shift @$total;
-	$total =~ s/[^\d.,]//g;
+	$total = shift @$last_row;
+	$total =~ s/[^\d.,]//g;	# Strip everything but the number
     }
-    else
+    elsif( 2 == scalar @$last_row )	# June 2010 format
     {
-	$currency = @$total[8];
-	$total = @$total[7];
-	$total =~ s/[^\d.,]//g;
+	$units = @$last_row[1];
+	$last_row = pop @$data;
+	$total = @$last_row[1];
+	$last_row = pop @$data;
+	my $num_rows = @$last_row[1];
+	# Consistency check: the number of rows in the table should match the Total_Rows line
+	return undef if $num_rows != scalar @$data;
+    }
+    else				# Pre-February 2009 format
+    {
+	$currency = @$last_row[8];
+	$total = @$last_row[7];
+	$total =~ s/[^\d.,]//g if defined $total;
     }
 
     # Convert the various region-specific date formats to YYYYMMDD
@@ -115,7 +128,7 @@ sub parse_financial_report
 	}
     }
 
-    ('header', $header, 'data', $data, 'total', $total, 'currency', $currency);
+    ('header', $header, 'data', $data, 'total', $total, 'currency', $currency, 'units', $units);
 }
 
 # Parse a gzip'd summary file fetched from the Sales/Trend page
@@ -276,10 +289,7 @@ sub financial_report_list
     @forms = grep $_->find_input('itemsPerPage', 'text'), @forms;
     my $form = shift @forms;
     return undef unless $form;
-
-    # Parse the input's label to find the highest value that it can be set to
-    $r->as_string =~ /items\/page \(max (\d+)\)/;
-    $form->value('itemsPerPage', $1);
+    $form->value('itemsPerPage', $s->{max_financial_reports_per_page});
     $r = $s->{ua}->request($form->click);
     return undef unless $r;
     $s->{response}{financial_list} = $r;
@@ -586,30 +596,63 @@ sub sales_form
     shift @forms;
 }
 
-# Fetch the Financial Reports page and cache the response
+# Fetch the desired Financial Reports page and cache the response
+#  Fetches the first page if no page number is given
 sub financial_response
 {
     my $s = shift;
+    my $page = 1;
+    $page = shift if scalar @_;
 
-# Returned the cached response to avoid another trip on the net
-    return $s->{response}{financial} if $s->{response}{financial};
+    # Try the cache first
+    return $s->{'response'}{'financial'}{$page} if $s->{'response'}{'financial'}{$page};
 
     unless( $s->{financial_path} )
     {
 	# Nothing to do without the main menu
 	return undef unless $s->{main_menu_tree};
 
-	# Find the Fincial Reports path that's listed on the main menu
+	# Find the Financial Reports path that's listed on the main menu
 	my $element = $s->{main_menu_tree}->look_down('_tag', 'a', sub { $_[0]->as_trimmed_text eq 'Financial Reports'});
 	return undef unless $element;
 	$s->{financial_path} = $element->attr('href');
 	return undef unless $s->{financial_path};
     }
 
-    my $r = $s->request($s->{financial_path});
-    return undef unless $r;
+    my $r;
+    if( $page > 1 )
+    {
+	$r = $s->financial_response;		# Want the form on the first page
 
-    $s->{response}{financial} = $r;
+	return undef if $page > $s->{num_financial_report_pages};
+
+	# Get the Items/Page form and set to display the desired page
+	my @forms = HTML::Form->parse($r);
+	@forms = grep $_->find_input('currPage', 'text'), @forms;
+	my $form = shift @forms;
+	return undef unless $form;
+
+	$form->value('currPage', $page);	# Set the input for the desired page
+	$r = $s->{ua}->request($form->click);	# Get the new page
+    }
+    else
+    {
+	$r = $s->request($s->{'financial_path'});
+
+	# Find the number of available financial reports
+	$r->content =~ /(\d+) iTunes Financial Reports/;
+	$s->{num_financial_reports} = $1;
+
+	$r->content =~ /Page\s*<input.*\/>\s*of\s*(\d+)\s*/;
+	$s->{num_financial_report_pages} = $1;
+
+	# Parse the input's label to find the highest value that it can be set to
+	$r->content =~ /items\/page \(max (\d+)\)/;
+	$s->{max_financial_reports_per_page} = $1;
+    }
+
+    return undef unless $r;
+    $s->{'response'}{'financial'}{$page} = $r;
 }
 
 # Follow the Sales and Trends redirect and store the response for later use
